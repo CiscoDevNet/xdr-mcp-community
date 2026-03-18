@@ -22,9 +22,11 @@ npm start
 1. [Authentication](#authentication)
 2. [API Base URLs & Regions](#api-base-urls--regions)
 3. [Tool Overview (27 Tools)](#tool-overview-27-tools)
-4. [Change Log](#change-log)
-5. [Known Issues & Workarounds](#known-issues--workarounds)
-6. [References](#references)
+4. [Resources](#resources)
+5. [Prompts](#prompts)
+6. [Change Log](#change-log)
+7. [Known Issues & Workarounds](#known-issues--workarounds)
+8. [References](#references)
 
 ---
 
@@ -54,7 +56,7 @@ Response: `access_token`, `token_type` (bearer), `expires_in` (seconds)
 - **Never** put credentials in `mcp.json`
 - Use `.env` file (copy from `.env.example`)
 - Required env vars: `XDR_CLIENT_ID`, `XDR_CLIENT_PASSWORD`
-- Optional: `XDR_REGION` (us | eu | apjc)
+- Optional: `XDR_REGION` (us | eu | apjc), `XDR_CONURE_BASE_URL` (override Conure API base)
 
 ---
 
@@ -64,27 +66,32 @@ Different XDR API families use **different base URLs**. Mixing these causes 404 
 
 | API Family | Base URL (US) | Used By |
 |------------|---------------|---------|
-| **Platform (IROH)** | `https://visibility.amp.cisco.com/iroh` | Inspect, Enrich, Incidents, Response, Casebooks, Profile, Integrations |
+| **Platform (IROH)** | `https://visibility.amp.cisco.com/iroh` | Inspect, Enrich, Incident get/update/worklog, Response, Casebooks, Profile, Integrations |
 | **Private Intel (CTIA)** | `https://private.intel.amp.cisco.com/ctia` | Indicators, Judgments, Sightings, Feeds |
 | **Automation** | `https://automate.us.security.cisco.com/api` | Workflows, Instances |
+| **Conure v2** | `https://conure.us.security.cisco.com` | Incident search (list) |
 
 ### Region Mapping
 
-| Region | Platform | Private Intel | Automation |
-|--------|----------|---------------|------------|
-| **us** | visibility.amp.cisco.com | private.intel.amp.cisco.com | automate.us.security.cisco.com |
-| **eu** | visibility.eu.amp.cisco.com | private.intel.eu.amp.cisco.com | automate.eu.security.cisco.com |
-| **apjc** | visibility.apjc.amp.cisco.com | private.intel.apjc.amp.cisco.com | automate.apjc.security.cisco.com |
+| Region | Platform | Private Intel | Automation | Conure |
+|--------|----------|---------------|-------------|--------|
+| **us** | visibility.amp.cisco.com | private.intel.amp.cisco.com | automate.us.security.cisco.com | conure.us.security.cisco.com |
+| **eu** | visibility.eu.amp.cisco.com | private.intel.eu.amp.cisco.com | automate.eu.security.cisco.com | conure.eu.security.cisco.com |
+| **apjc** | visibility.apjc.amp.cisco.com | private.intel.apjc.amp.cisco.com | automate.apjc.security.cisco.com | conure.apjc.security.cisco.com |
 
 ### IROH Platform API Paths (per [Cisco XDR Introduction](https://developer.cisco.com/docs/cisco-xdr/introduction/))
 
 - **Inspect**: `/iroh-inspect/inspect`
 - **Enrich**: `/iroh-enrich/observe/observables`, `/iroh-enrich/deliberate/observables`, `/iroh-enrich/refer/observables`
-- **Incident Management**: `/iroh-incident/incidents`
+- **Incident Management**: `/iroh-incident/incidents` (get, update, worklog, observables)
 - **Response**: `/iroh-response/respond/observables`, `/iroh-response/respond/trigger`
 - **Casebooks**: `/iroh-casebook/casebooks`
 - **Profile**: `/iroh-profile/profile`
 - **Integrations**: `/iroh-int/integrations`
+
+### Conure v2 API (Incidents & Investigations)
+
+- **Incident Search**: `GET /v2/incident/search` — Query params: `status`, `from`, `to`, `limit`, `offset`
 
 ---
 
@@ -154,7 +161,66 @@ Different XDR API families use **different base URLs**. Mixing these causes 404 
 
 ---
 
+## Resources
+
+Resources expose XDR data via `xdr://` URIs. Clients can read them for context without calling tools.
+
+### Static Resources
+
+| URI | Description |
+|-----|-------------|
+| `xdr://incidents/open` | Open incidents (last 30 days) |
+| `xdr://incidents/recent` | Recent incidents, all statuses (last 7 days) |
+| `xdr://profile` | Organization profile and scopes |
+| `xdr://integrations` | Configured integration modules |
+
+### Resource Template (parameterized)
+
+| URI Template | Description |
+|--------------|-------------|
+| `xdr://incident/{incident_id}` | Full incident details by ID (e.g. `incident-2a5d7109-e5a6-44e1-891d-1fbbc92dcb87`) |
+
+### Usage
+
+In Cursor or other MCP clients, reference resources by URI. The AI can load `xdr://incidents/open` or `xdr://incident/incident-xxx` as context before responding.
+
+---
+
+## Prompts
+
+Prompts are reusable workflows that guide the AI through common XDR tasks.
+
+| Prompt | Description | Arguments |
+|--------|-------------|------------|
+| `triage_open_incidents` | Triage open incidents by priority, suggest next steps | `limit` (optional) |
+| `investigate_ioc` | Investigate an IOC across all integrations | `type`, `value` (required) |
+| `incident_drill_down` | Deep dive: incident details, observables, worklog | `incident_id` (required) |
+| `threat_intel_investigation` | Extract IOCs from text, investigate all | `content` (required) |
+| `daily_briefing` | Security briefing for N days | `days` (optional, default 1) |
+| `response_playbook` | Guide response actions for an incident | `incident_id` (required) |
+
+### Usage
+
+In Cursor, use the prompt picker or invoke a prompt by name with arguments. Each prompt returns a message that instructs the AI which tools to call and how to summarize results.
+
+---
+
 ## Change Log
+
+### v2.1.0 (2026-03)
+
+**Resources and Prompts added.**
+
+#### New Capabilities
+
+- **Resources**: 4 static resources (`xdr://incidents/open`, `xdr://incidents/recent`, `xdr://profile`, `xdr://integrations`) + 1 template (`xdr://incident/{incident_id}`)
+- **Prompts**: 6 reusable workflows — triage_open_incidents, investigate_ioc, incident_drill_down, threat_intel_investigation, daily_briefing, response_playbook
+
+#### API Changes
+
+- **Incident List**: Switched from IROH `iroh-incident/incidents` to **Conure v2** `GET /v2/incident/search` (fixes 404)
+- **Config**: Added `conureBaseUrl` and `XDR_CONURE_BASE_URL` env override
+- **Incident List**: Added `from`/`to` date params (ISO 8601); defaults to last 30 days
 
 ### v2.0.0 (2026-03)
 
@@ -172,7 +238,7 @@ Different XDR API families use **different base URLs**. Mixing these causes 404 
 
 #### API Changes
 
-- **Incidents**: Switched from `private-intel/incident` to `iroh-incident/incidents` (IROH Platform API per [Cisco XDR Introduction](https://developer.cisco.com/docs/cisco-xdr/introduction/))
+- **Incidents**: List uses Conure v2; get/update/worklog use IROH `iroh-incident/incidents`
 - **Response**: New `iroh-response/respond/observables` and `iroh-response/respond/trigger`
 - **Casebooks**: New `iroh-casebook/casebooks`
 - **Integrations**: New `iroh-int/integrations`

@@ -9,6 +9,11 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
+  ListResourcesRequestSchema,
+  ListResourceTemplatesRequestSchema,
+  ReadResourceRequestSchema,
+  ListPromptsRequestSchema,
+  GetPromptRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js';
 import { z } from 'zod';
 import { XdrApi } from './services/xdrApi.js';
@@ -42,9 +47,240 @@ const ObservableInput = z.object({
 // ─────────────────────────────────────────────────────────────────────────────
 const server = new Server(
   { name: 'cisco-xdr-mcp', version: '2.0.0' },
-  { capabilities: { tools: {} } }
+  { capabilities: { tools: {}, resources: {}, prompts: {} } }
 );
 
+// ─────────────────────────────────────────────────────────────────────────────
+//  RESOURCES (xdr:// URI scheme)
+// ─────────────────────────────────────────────────────────────────────────────
+const XDR_RESOURCE_BASE = 'xdr://';
+
+server.setRequestHandler(ListResourcesRequestSchema, async () => ({
+  resources: [
+    {
+      uri: `${XDR_RESOURCE_BASE}incidents/open`,
+      name: 'Open Incidents',
+      description: 'List of open XDR incidents (last 30 days)',
+      mimeType: 'application/json',
+    },
+    {
+      uri: `${XDR_RESOURCE_BASE}incidents/recent`,
+      name: 'Recent Incidents',
+      description: 'Recent incidents, all statuses (last 7 days)',
+      mimeType: 'application/json',
+    },
+    {
+      uri: `${XDR_RESOURCE_BASE}profile`,
+      name: 'XDR Profile',
+      description: 'Organization profile and scopes',
+      mimeType: 'application/json',
+    },
+    {
+      uri: `${XDR_RESOURCE_BASE}integrations`,
+      name: 'XDR Integrations',
+      description: 'Configured integration modules (health, module_instance_id)',
+      mimeType: 'application/json',
+    },
+  ],
+}));
+
+server.setRequestHandler(ListResourceTemplatesRequestSchema, async () => ({
+  resourceTemplates: [
+    {
+      uriTemplate: `${XDR_RESOURCE_BASE}incident/{incident_id}`,
+      name: 'Incident Details',
+      description: 'Full incident details by ID (e.g. incident-2a5d7109-e5a6-44e1-891d-1fbbc92dcb87)',
+      mimeType: 'application/json',
+    },
+  ],
+}));
+
+server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
+  const uri = request.params.uri;
+  if (!uri.startsWith(XDR_RESOURCE_BASE)) {
+    return { contents: [{ uri, text: JSON.stringify({ error: `Unknown resource scheme. Expected ${XDR_RESOURCE_BASE}` }) }] };
+  }
+  const path = uri.slice(XDR_RESOURCE_BASE.length);
+  let text: string;
+
+  try {
+    if (path === 'incidents/open') {
+      const now = new Date();
+      const from = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000).toISOString();
+      const to = now.toISOString();
+      const p = new URLSearchParams({ status: 'Open', limit: '100', from, to });
+      const data = await xdrApi.get(`${CONURE}/v2/incident/search?${p}`);
+      text = JSON.stringify(data, null, 2);
+    } else if (path === 'incidents/recent') {
+      const now = new Date();
+      const from = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000).toISOString();
+      const to = now.toISOString();
+      const p = new URLSearchParams({ limit: '100', from, to });
+      const data = await xdrApi.get(`${CONURE}/v2/incident/search?${p}`);
+      text = JSON.stringify(data, null, 2);
+    } else if (path === 'profile') {
+      const data = await xdrApi.get(`${VIS}/iroh-profile/profile`);
+      text = JSON.stringify(data, null, 2);
+    } else if (path === 'integrations') {
+      const data = await xdrApi.get(`${VIS}/iroh-int/integrations`);
+      text = JSON.stringify(data, null, 2);
+    } else if (path.startsWith('incident/')) {
+      const incidentId = decodeURIComponent(path.slice('incident/'.length));
+      const data = await xdrApi.get(`${VIS}/iroh-incident/incidents/${incidentId}`);
+      text = JSON.stringify(data, null, 2);
+    } else {
+      text = JSON.stringify({ error: `Unknown resource: ${path}` });
+    }
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    text = JSON.stringify({ error: msg });
+  }
+
+  return { contents: [{ uri, mimeType: 'application/json', text }] };
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  PROMPTS (reusable workflows)
+// ─────────────────────────────────────────────────────────────────────────────
+server.setRequestHandler(ListPromptsRequestSchema, async () => ({
+  prompts: [
+    {
+      name: 'triage_open_incidents',
+      description: 'Triage open XDR incidents by priority. Lists open incidents, summarizes by severity, suggests next steps.',
+      arguments: [
+        { name: 'limit', description: 'Max incidents to include (default 25)', required: false },
+      ],
+    },
+    {
+      name: 'investigate_ioc',
+      description: 'Investigate an IOC (IP, domain, hash, etc.) across all XDR integrations.',
+      arguments: [
+        { name: 'type', description: 'Observable type: ip, domain, url, sha256, md5, sha1, email', required: true },
+        { name: 'value', description: 'The observable value to investigate', required: true },
+      ],
+    },
+    {
+      name: 'incident_drill_down',
+      description: 'Deep dive into a specific incident: details, observables, worklog, response suggestions.',
+      arguments: [
+        { name: 'incident_id', description: 'Incident ID (e.g. incident-2a5d7109-e5a6-44e1-891d-1fbbc92dcb87)', required: true },
+      ],
+    },
+    {
+      name: 'threat_intel_investigation',
+      description: 'Process threat intel content (blog, email, report), extract IOCs, and investigate all.',
+      arguments: [
+        { name: 'content', description: 'Free-form text containing IOCs to extract and investigate', required: true },
+      ],
+    },
+    {
+      name: 'daily_briefing',
+      description: 'Daily security briefing: recent incidents, summary by severity, open items.',
+      arguments: [
+        { name: 'days', description: 'Number of days to include (default 1)', required: false },
+      ],
+    },
+    {
+      name: 'response_playbook',
+      description: 'Guide response for a confirmed incident: available actions, suggested playbook steps.',
+      arguments: [
+        { name: 'incident_id', description: 'Incident ID to respond to', required: true },
+      ],
+    },
+  ],
+}));
+
+server.setRequestHandler(GetPromptRequestSchema, async (request) => {
+  const { name, arguments: args = {} } = request.params;
+  const limit = args.limit ?? '25';
+  const days = args.days ?? '1';
+
+  const prompts: Record<string, { messages: Array<{ role: 'user' | 'assistant'; content: Array<{ type: 'text'; text: string }> }> }> = {
+    triage_open_incidents: {
+      messages: [
+        {
+          role: 'user',
+          content: [{
+            type: 'text',
+            text: `Triage open XDR incidents. Use xdr_incidents_list with status='open' and limit=${limit}. Then:
+1. Summarize each incident: title, severity, scores (global, TTP, asset), detection sources
+2. Group by severity (Critical/High/Medium/Low)
+3. For each incident, suggest: (a) whether to investigate further, (b) key observables to run through xdr_investigate, (c) whether to trigger a response playbook
+4. Provide an overall triage priority order.`,
+          }],
+        },
+      ],
+    },
+    investigate_ioc: {
+      messages: [
+        {
+          role: 'user',
+          content: [{
+            type: 'text',
+            text: `Investigate this IOC in XDR. Use xdr_investigate with observables: [{"type":"${args.type ?? 'ip'}", "value":"${args.value ?? ''}"}]. Include verdicts and pivot links. Then summarize: (1) Where was it seen (sightings), (2) Verdict (clean/malicious/suspicious/unknown), (3) Pivot links to open in Umbrella, Secure Endpoint, etc., (4) Recommended next steps.`,
+          }],
+        },
+      ],
+    },
+    incident_drill_down: {
+      messages: [
+        {
+          role: 'user',
+          content: [{
+            type: 'text',
+            text: `Deep dive into incident ${args.incident_id ?? ''}. Call xdr_incident_get, then xdr_incident_observables, then xdr_incident_worklog. Summarize: (1) Incident overview (title, severity, status, description), (2) All observables (IPs, domains, hashes, etc.), (3) Worklog/audit trail, (4) Suggested response actions (use xdr_response_get_actions if needed).`,
+          }],
+        },
+      ],
+    },
+    threat_intel_investigation: {
+      messages: [
+        {
+          role: 'user',
+          content: [{
+            type: 'text',
+            text: `Process this threat intel content. Use xdr_inspect_and_investigate with the content. Then: (1) List all IOCs extracted, (2) For each, summarize sightings and verdicts, (3) Highlight any malicious/suspicious findings, (4) Suggest creating a casebook or triggering response for confirmed threats. Content:\n\n${args.content ?? ''}`,
+          }],
+        },
+      ],
+    },
+    daily_briefing: {
+      messages: [
+        {
+          role: 'user',
+          content: [{
+            type: 'text',
+            text: `Generate a ${days}-day security briefing. Use xdr_incidents_list with from/to for the last ${days} day(s), no status filter. Then: (1) Count by status (Open, New, Closed), (2) Count by severity, (3) List open/high-priority incidents needing attention, (4) Summarize trends.`,
+          }],
+        },
+      ],
+    },
+    response_playbook: {
+      messages: [
+        {
+          role: 'user',
+          content: [{
+            type: 'text',
+            text: `Guide response for incident ${args.incident_id ?? ''}. Call xdr_incident_get and xdr_incident_observables. Then call xdr_response_get_actions for key observables. Summarize: (1) Available actions (block, isolate, quarantine, etc.), (2) Which observables to act on, (3) Step-by-step playbook (use xdr_response_trigger when user confirms).`,
+          }],
+        },
+      ],
+    },
+  };
+
+  const prompt = prompts[name];
+  if (!prompt) {
+    return {
+      description: `Unknown prompt: ${name}`,
+      messages: [{ role: 'assistant', content: [{ type: 'text', text: `Prompt "${name}" not found. Available: ${Object.keys(prompts).join(', ')}` }] }],
+    };
+  }
+  return prompt;
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  TOOLS
+// ─────────────────────────────────────────────────────────────────────────────
 server.setRequestHandler(ListToolsRequestSchema, async () => ({
   tools: [
 
@@ -839,5 +1075,5 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 export async function run(): Promise<void> {
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  console.error('Cisco XDR MCP Server v2.0.0 running — 27 tools registered');
+  console.error('Cisco XDR MCP Server v2.0.0 running — 27 tools, 4 resources, 1 template, 6 prompts');
 }
