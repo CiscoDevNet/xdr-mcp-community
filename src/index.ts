@@ -4,10 +4,9 @@
  */
 
 import 'dotenv/config';
-import { CiscoXdrMCPServer } from './server.js';
+import { run } from './server.js';
 
-const server = new CiscoXdrMCPServer();
-server.run().catch((err) => {
+run().catch((err) => {
   console.error('Fatal error:', err);
   process.exit(1);
 });

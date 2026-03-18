@@ -1,6 +1,7 @@
 /*
- * Cisco XDR MCP Server
- * Exposes XDR APIs as MCP tools: Automation, Enrich, Inspect, Incidents, and more
+ * Cisco XDR MCP Server v2.0
+ * 27 tools across Inspect, Investigate, Incidents, Response, Casebooks, Intel, Workflows, Admin
+ * API reference: https://developer.cisco.com/docs/cisco-xdr/introduction/
  */
 
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
@@ -8,432 +9,835 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
-  Tool,
 } from '@modelcontextprotocol/sdk/types.js';
-import { XdrApiService } from './services/xdrApi.js';
+import { z } from 'zod';
+import { XdrApi } from './services/xdrApi.js';
 import { loadConfig } from './utils/config.js';
 
-export class CiscoXdrMCPServer {
-  private server: Server;
-  private api: XdrApiService;
+// ─────────────────────────────────────────────────────────────────────────────
+//  API BASE URLS (from config - region-aware)
+//  Different XDR API families use DIFFERENT base URLs.
+// ─────────────────────────────────────────────────────────────────────────────
+const config = loadConfig();
+const VIS = config.platformBaseUrl!;      // IROH: Inspect, Enrich, Response, Casebook, Profile, Integrations
+const INTEL = config.privateIntelBaseUrl!; // CTIA: indicators, judgments, sightings, feeds
+const AUTO = config.automateBaseUrl!;      // Automation: workflows, instances
+const CONURE = config.conureBaseUrl!;      // Conure v2: Incidents & Investigations search
 
-  constructor() {
-    const config = loadConfig();
-    this.api = new XdrApiService(config);
+const xdrApi = new XdrApi(config);
 
-    this.server = new Server(
-      {
-        name: 'cisco-xdr-mcp',
-        version: '1.0.0',
-      },
-      {
-        capabilities: {
-          tools: { listChanged: false },
-        },
-      }
-    );
+// ─────────────────────────────────────────────────────────────────────────────
+//  SHARED SCHEMAS
+// ─────────────────────────────────────────────────────────────────────────────
+const ObservableInput = z.object({
+  type: z.enum([
+    'ip', 'ipv6', 'domain', 'url', 'sha256', 'md5', 'sha1',
+    'email', 'mac_address', 'hostname', 'amp_computer_guid',
+  ]),
+  value: z.string().min(1),
+});
 
-    this.setupHandlers();
-  }
+// ─────────────────────────────────────────────────────────────────────────────
+//  TOOL DEFINITIONS
+// ─────────────────────────────────────────────────────────────────────────────
+const server = new Server(
+  { name: 'cisco-xdr-mcp', version: '2.0.0' },
+  { capabilities: { tools: {} } }
+);
 
-  private setupHandlers(): void {
-    this.server.setRequestHandler(ListToolsRequestSchema, async () => ({
-      tools: this.getAllTools(),
-    }));
+server.setRequestHandler(ListToolsRequestSchema, async () => ({
+  tools: [
 
-    this.server.setRequestHandler(CallToolRequestSchema, async (request) => {
-      const { name, arguments: args } = request.params;
-      try {
-        const result = await this.handleToolCall(name, args || {});
-        return {
-          content: [{ type: 'text', text: JSON.stringify(result, null, 2) }],
-        };
-      } catch (error: unknown) {
-        const message = error instanceof Error ? error.message : String(error);
-        return {
-          content: [{ type: 'text', text: `Error: ${message}` }],
-          isError: true,
-        };
-      }
-    });
-  }
-
-  private getAllTools(): Tool[] {
-    return [
-      // === Inspect (Platform) - Extract observables from text ===
-      {
-        name: 'xdr_inspect',
-        description: 'Extract observables (IPs, domains, hashes, emails, etc.) from a text string. Use for threat hunting and IOC extraction.',
-        inputSchema: {
-          type: 'object',
-          properties: {
-            content: { type: 'string', description: 'Text to inspect (e.g., email body, log line, URL)' },
+    // ════════════════════════════════════════════════════════════════════════
+    //  SECTION 1 — INSPECT & INVESTIGATE (Core threat hunting pipeline)
+    // ════════════════════════════════════════════════════════════════════════
+    {
+      name: 'xdr_inspect',
+      description:
+        'Parse free-form text to extract observable IOCs (IPs, domains, URLs, hashes, emails). ' +
+        'Feed it threat intel blog posts, Talos advisories, log pastes, or any text. ' +
+        'Returns structured observables ready for xdr_investigate. ' +
+        'Maps to XDR Investigate > New Investigation text input.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          content: {
+            type: 'string',
+            description: 'Free-form text up to 2000 chars. Can be paste of blog post, alert, log line, etc.',
           },
-          required: ['content'],
+        },
+        required: ['content'],
+      },
+    },
+
+    {
+      name: 'xdr_investigate',
+      description:
+        'Full threat investigation across ALL configured integrations ' +
+        '(Umbrella, SCA, Secure Endpoint, FMC, Meraki, Duo, Splunk, CrowdStrike, etc.). ' +
+        'Returns sightings (where/when seen in your environment), verdicts (clean/malicious/' +
+        'suspicious/unknown from Talos + integrated products), and pivot links to source products. ' +
+        'This is the PRIMARY threat hunting tool — use it for any IOC you want to chase.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          observables: {
+            type: 'array',
+            items: {
+              type: 'object',
+              properties: {
+                type: { type: 'string', enum: ['ip','ipv6','domain','url','sha256','md5','sha1','email','mac_address','hostname'] },
+                value: { type: 'string' },
+              },
+              required: ['type','value'],
+            },
+            description: 'Observables to investigate. Mix types freely.',
+          },
+          include_verdicts: { type: 'boolean', default: true, description: 'Include deliberate (disposition/verdict) results.' },
+          include_pivot_links: { type: 'boolean', default: true, description: 'Include refer (pivot links to open in Umbrella, Secure Endpoint, etc.).' },
+        },
+        required: ['observables'],
+      },
+    },
+
+    {
+      name: 'xdr_inspect_and_investigate',
+      description:
+        'Two-step shortcut: parse text for IOCs then immediately investigate all found observables. ' +
+        'Ideal for processing threat intel content. Paste a Talos blog post, a phishing email, ' +
+        'or a OSINT report and get full enrichment in one call.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          content: { type: 'string', description: 'Free-form text containing embedded IOCs to extract and investigate.' },
+        },
+        required: ['content'],
+      },
+    },
+
+    // ════════════════════════════════════════════════════════════════════════
+    //  SECTION 2 — INCIDENTS (Triage, investigate, respond)
+    // ════════════════════════════════════════════════════════════════════════
+    {
+      name: 'xdr_incidents_list',
+      description:
+        'List XDR incidents sorted by priority score (0-1000). Each incident includes: ' +
+        'priority score (MITRE TTP risk + asset value), name, source product, status, ' +
+        'MITRE tactics, and assigned analyst. Filter by status to focus on open incidents. ' +
+        'Use from/to for date range (ISO 8601). Omit for last 30 days. Maps to XDR Incidents page.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          status: { type: 'string', enum: ['new','open','closed'], description: 'Filter by status. Omit for all incidents.' },
+          limit: { type: 'number', default: 25, description: '1-100 incidents.' },
+          offset: { type: 'number', default: 0 },
+          from: { type: 'string', description: 'Start date ISO 8601. Default: 30 days ago.' },
+          to: { type: 'string', description: 'End date ISO 8601. Default: now.' },
         },
       },
+    },
 
-      // === Enrich (Platform) - Threat intelligence ===
-      {
-        name: 'xdr_enrich_observe',
-        description: 'Get in-depth threat context for observables. Returns verdicts, judgements, and investigation data from integrated modules.',
-        inputSchema: {
-          type: 'object',
-          properties: {
-            observables: {
-              type: 'array',
-              items: {
-                type: 'object',
-                properties: {
-                  type: { type: 'string', description: 'Observable type: ip, domain, url, sha256, md5, email, etc.' },
-                  value: { type: 'string', description: 'Observable value' },
-                },
-                required: ['type', 'value'],
-              },
-              description: 'Array of {type, value} observables to enrich',
+    {
+      name: 'xdr_incident_get',
+      description:
+        'Get full incident details: attack graph observables, merged incidents, assets involved ' +
+        '(with crown-jewel labels and asset values), MITRE TTP mapping, AI-generated summary, ' +
+        'all detections by source, and response playbook status. ' +
+        'Use this after xdr_incidents_list to drill into a specific incident.',
+      inputSchema: {
+        type: 'object',
+        properties: { incident_id: { type: 'string', description: 'Incident ID from xdr_incidents_list.' } },
+        required: ['incident_id'],
+      },
+    },
+
+    {
+      name: 'xdr_incident_update',
+      description:
+        'Update an incident: change status to open/closed, assign to an analyst, ' +
+        'or add a resolution note when closing. Mirrors the GUI Status and Assign controls.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          incident_id: { type: 'string' },
+          status: { type: 'string', enum: ['new','open','closed'], description: 'New incident lifecycle status.' },
+          assignee_id: { type: 'string', description: 'User ID to assign incident to.' },
+          resolution: { type: 'string', description: 'Resolution note required when setting status to closed.' },
+        },
+        required: ['incident_id'],
+      },
+    },
+
+    {
+      name: 'xdr_incident_worklog',
+      description:
+        'Retrieve the complete worklog/audit trail for an incident. Shows every action taken, ' +
+        'automated workflow executions, analyst notes, and containment steps with timestamps. ' +
+        'Used in PICERL Lessons Learned phase for post-incident review.',
+      inputSchema: {
+        type: 'object',
+        properties: { incident_id: { type: 'string' } },
+        required: ['incident_id'],
+      },
+    },
+
+    {
+      name: 'xdr_incident_worklog_add',
+      description:
+        'Add a note to an incident worklog. Use for documenting findings, analysis steps, ' +
+        'and decisions during active incident response. All entries are timestamped and auditable.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          incident_id: { type: 'string' },
+          note: { type: 'string', description: 'Note text to append to worklog.' },
+        },
+        required: ['incident_id','note'],
+      },
+    },
+
+    {
+      name: 'xdr_incident_observables',
+      description:
+        'List all observables associated with an incident (IPs, domains, file hashes, hostnames, ' +
+        'users, processes, URLs). Returns disposition (malicious/suspicious/clean) for each. ' +
+        'Use this to extract the full IOC list from an incident for hunting or blocking.',
+      inputSchema: {
+        type: 'object',
+        properties: { incident_id: { type: 'string' } },
+        required: ['incident_id'],
+      },
+    },
+
+    // ════════════════════════════════════════════════════════════════════════
+    //  SECTION 3 — RESPONSE ACTIONS (Contain, block, isolate)
+    // ════════════════════════════════════════════════════════════════════════
+    {
+      name: 'xdr_response_get_actions',
+      description:
+        'Get all available response actions for observables across integrated products. ' +
+        'Returns actionable capabilities such as: block domain (Umbrella), isolate endpoint ' +
+        '(Secure Endpoint / CrowdStrike / Defender / SentinelOne / Cybereason), ' +
+        'block file hash (EDR), block IP (FMC firewall), disable user (Duo / Entra), ' +
+        'quarantine email (SMA). ' +
+        'ALWAYS call this before xdr_response_trigger to get valid action_id and module_instance_id.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          observables: {
+            type: 'array',
+            items: {
+              type: 'object',
+              properties: { type: { type: 'string' }, value: { type: 'string' } },
+              required: ['type','value'],
             },
           },
-          required: ['observables'],
+        },
+        required: ['observables'],
+      },
+    },
+
+    {
+      name: 'xdr_response_trigger',
+      description:
+        'Execute a specific response action. Requires action_id, module_instance_id, ' +
+        'and module_type_id from xdr_response_get_actions output. ' +
+        'Examples: isolate a compromised endpoint, block a C2 domain in Umbrella, ' +
+        'add a malicious hash to EDR block list, block attacker IP in FMC firewall. ' +
+        'All actions are logged automatically to the incident worklog.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          observable_type: { type: 'string', description: 'e.g. domain, ip, sha256, amp_computer_guid' },
+          observable_value: { type: 'string' },
+          action_id: { type: 'string', description: 'From xdr_response_get_actions output.' },
+          module_instance_id: { type: 'string', description: 'From xdr_response_get_actions output.' },
+          module_type_id: { type: 'string', description: 'From xdr_response_get_actions output.' },
+        },
+        required: ['observable_type','observable_value','action_id','module_instance_id','module_type_id'],
+      },
+    },
+
+    // ════════════════════════════════════════════════════════════════════════
+    //  SECTION 4 — CASEBOOKS (Investigation tracking)
+    // ════════════════════════════════════════════════════════════════════════
+    {
+      name: 'xdr_casebook_list',
+      description:
+        'List investigation casebooks. Casebooks track ongoing threat hunts: ' +
+        'collect observables, notes, and findings across multiple sessions. ' +
+        'Shared across the org — not private to individual users.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          limit: { type: 'number', default: 25 },
+          offset: { type: 'number', default: 0 },
         },
       },
-      {
-        name: 'xdr_enrich_deliberate',
-        description: 'Quickly get verdicts (malicious/benign/unknown) for observables from all integrated modules.',
-        inputSchema: {
-          type: 'object',
-          properties: {
-            observables: {
-              type: 'array',
-              items: {
-                type: 'object',
-                properties: {
-                  type: { type: 'string' },
-                  value: { type: 'string' },
-                },
-                required: ['type', 'value'],
-              },
+    },
+
+    {
+      name: 'xdr_casebook_get',
+      description: 'Get full casebook details including all collected observables and investigation notes.',
+      inputSchema: {
+        type: 'object',
+        properties: { casebook_id: { type: 'string' } },
+        required: ['casebook_id'],
+      },
+    },
+
+    {
+      name: 'xdr_casebook_create',
+      description:
+        'Create a new investigation casebook. Use at the start of a new threat hunt or ' +
+        'when investigating a suspicious IOC that is not yet a formal incident. ' +
+        'Optionally seed with initial observables and a working hypothesis.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          title: { type: 'string', description: "Descriptive title e.g. 'Hunt: Suspicious C2 Domain 2026-03-17'" },
+          description: { type: 'string', description: 'Initial hypothesis or investigation notes.' },
+          observables: {
+            type: 'array',
+            items: { type: 'object', properties: { type: { type: 'string' }, value: { type: 'string' } } },
+            description: 'Seed observables to include from the start.',
+          },
+          tlp: { type: 'string', enum: ['white','green','amber','red'], default: 'amber', description: 'TLP classification for sharing.' },
+        },
+        required: ['title'],
+      },
+    },
+
+    {
+      name: 'xdr_casebook_add_observables',
+      description:
+        'Add new observables to an existing casebook during ongoing investigation. ' +
+        'Use as you uncover new IOCs — e.g. add C2 IPs and file hashes discovered ' +
+        'while pivoting through an incident\'s attack graph.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          casebook_id: { type: 'string' },
+          observables: {
+            type: 'array',
+            items: {
+              type: 'object',
+              properties: { type: { type: 'string' }, value: { type: 'string' } },
+              required: ['type','value'],
             },
           },
-          required: ['observables'],
         },
+        required: ['casebook_id','observables'],
       },
-      {
-        name: 'xdr_enrich_refer',
-        description: 'Get reference links for observables to pivot investigation in product interfaces.',
-        inputSchema: {
-          type: 'object',
-          properties: {
-            observables: {
-              type: 'array',
-              items: {
-                type: 'object',
-                properties: {
-                  type: { type: 'string' },
-                  value: { type: 'string' },
-                },
-                required: ['type', 'value'],
-              },
-            },
-          },
-          required: ['observables'],
-        },
-      },
+    },
 
-      // === Incident Management (Private Intel) ===
-      {
-        name: 'xdr_incident_summary',
-        description: 'Get incident summary with related threat context, linked incidents, observables, and severity.',
-        inputSchema: {
-          type: 'object',
-          properties: {
-            incident_id: { type: 'string', description: 'Incident ID (GUID or short-id)' },
-          },
-          required: ['incident_id'],
+    // ════════════════════════════════════════════════════════════════════════
+    //  SECTION 5 — THREAT INTELLIGENCE (Talos + private intel)
+    // ════════════════════════════════════════════════════════════════════════
+    {
+      name: 'xdr_intel_indicators',
+      description:
+        'Search threat intelligence indicators. Indicators describe patterns of behavior ' +
+        'indicating malicious activity. Covers both Cisco Talos public intel and your ' +
+        'private intelligence store. Search by malware family, campaign name, or MITRE technique.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          query: { type: 'string', description: 'Search term: malware name, campaign, actor, MITRE technique ID.' },
+          limit: { type: 'number', default: 25 },
+          offset: { type: 'number', default: 0 },
         },
       },
-      {
-        name: 'xdr_incident_worklog',
-        description: 'Get worklog notes for an incident.',
-        inputSchema: {
-          type: 'object',
-          properties: {
-            incident_id: { type: 'string' },
-          },
-          required: ['incident_id'],
-        },
-      },
-      {
-        name: 'xdr_incident_create',
-        description: 'Create a custom incident in XDR.',
-        inputSchema: {
-          type: 'object',
-          properties: {
-            title: { type: 'string' },
-            description: { type: 'string' },
-            severity: { type: 'number', description: 'Severity 1-100' },
-            status: { type: 'string', description: 'e.g. New, Open, Stalled, Closed' },
-          },
-          required: ['title'],
-        },
-      },
+    },
 
-      // === Automation - Workflows ===
-      {
-        name: 'xdr_workflows_list',
-        description: 'List workflows with optional filters. Supports search, state, limit, start.',
-        inputSchema: {
-          type: 'object',
-          properties: {
-            limit: { type: 'number', description: 'Number of workflows (required, 1-100)', default: 20 },
-            start: { type: 'number', description: 'Pagination offset' },
-            search: { type: 'string', description: 'Search term for workflow names' },
-            state: { type: 'string', description: 'Filter by state (comma-separated)' },
-            is_atomic: { type: 'boolean', description: 'Filter atomic vs non-atomic workflows' },
-          },
-          required: ['limit'],
+    {
+      name: 'xdr_intel_judgments',
+      description:
+        'Get disposition judgments for a specific observable. A judgment records ' +
+        'clean/malicious/suspicious/unknown/common disposition with an expiry date. ' +
+        'Covers both global Talos verdicts and any private judgments your org has added.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          observable_type: { type: 'string', description: 'Observable type: ip, domain, sha256, url, etc.' },
+          observable_value: { type: 'string' },
+          limit: { type: 'number', default: 25 },
         },
+        required: ['observable_type','observable_value'],
       },
-      {
-        name: 'xdr_workflow_get',
-        description: 'Get a workflow by ID.',
-        inputSchema: {
-          type: 'object',
-          properties: {
-            workflow_id: { type: 'string' },
-          },
-          required: ['workflow_id'],
-        },
-      },
-      {
-        name: 'xdr_workflow_start',
-        description: 'Start a workflow execution. Use workflow_id or unique_name.',
-        inputSchema: {
-          type: 'object',
-          properties: {
-            workflow_id: { type: 'string' },
-            unique_name: { type: 'string' },
-            sync: { type: 'boolean', description: 'If true, wait for completion (up to ~28s)' },
-            async: { type: 'boolean', description: 'If true, run asynchronously' },
-          },
-        },
-      },
+    },
 
-      // === Automation - Workflow Instances ===
-      {
-        name: 'xdr_instances_list',
-        description: 'List workflow instances with filters (state, search, date range).',
-        inputSchema: {
-          type: 'object',
-          properties: {
-            limit: { type: 'number', required: true },
-            date_from: { type: 'string', description: 'ISO date e.g. 2024-01-01T00:00:00Z', required: true },
-            date_to: { type: 'string', description: 'ISO date' },
-            state: { type: 'string' },
-            search: { type: 'string' },
-            start: { type: 'number' },
-          },
-          required: ['limit', 'date_from'],
+    {
+      name: 'xdr_intel_feeds',
+      description:
+        'List private intelligence feeds (block lists, watch lists, allow lists). ' +
+        'These feeds are pushed to integrated products: Umbrella uses domain/URL feeds, ' +
+        'FMC uses IP block feeds. Use to check what is already blocked org-wide.',
+      inputSchema: {
+        type: 'object',
+        properties: { limit: { type: 'number', default: 25 } },
+      },
+    },
+
+    {
+      name: 'xdr_intel_sightings',
+      description:
+        'Search for sightings of an observable in your environment. A sighting records ' +
+        'when/where an IOC was observed: source product, timestamp, associated asset/user. ' +
+        'Use for intelligence-driven threat hunts — check if a known-bad IOC is lurking ' +
+        'undetected in your environment across SCA, Secure Endpoint, Umbrella, FMC, etc.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          observable_type: { type: 'string' },
+          observable_value: { type: 'string' },
+          start_time: { type: 'string', description: 'ISO 8601 start time e.g. 2026-03-01T00:00:00Z.' },
+          limit: { type: 'number', default: 50 },
+        },
+        required: ['observable_type','observable_value'],
+      },
+    },
+
+    // ════════════════════════════════════════════════════════════════════════
+    //  SECTION 6 — WORKFLOWS & AUTOMATION
+    // ════════════════════════════════════════════════════════════════════════
+    {
+      name: 'xdr_workflow_list',
+      description:
+        'List available XDR automation workflows. Includes built-in PICERL playbook workflows: ' +
+        "'XDR - Contain Incident Assets' (EDR quarantine), 'XDR - Contain Incident Domains' (Umbrella), " +
+        "'XDR - Contain Incident IPs' (FMC), 'XDR - Contain Incident File Hashes' (EDR), " +
+        "'XDR - Quarantine Email Messages' (SMA), 'XDR - Identify Vulnerabilities', " +
+        "'XDR - Unquarantine Assets', plus any custom workflows you have built.",
+      inputSchema: {
+        type: 'object',
+        properties: {
+          limit: { type: 'number', default: 50 },
+          offset: { type: 'number', default: 0 },
+          category: { type: 'string', description: 'Filter by category: response, investigate, notify, etc.' },
         },
       },
-      {
-        name: 'xdr_instance_get',
-        description: 'Get workflow instance details by ID.',
-        inputSchema: {
-          type: 'object',
-          properties: {
-            instance_id: { type: 'string' },
-          },
-          required: ['instance_id'],
+    },
+
+    {
+      name: 'xdr_workflow_get',
+      description: 'Get full workflow definition including description, input schema, and trigger types.',
+      inputSchema: {
+        type: 'object',
+        properties: { workflow_id: { type: 'string' } },
+        required: ['workflow_id'],
+      },
+    },
+
+    {
+      name: 'xdr_workflow_start',
+      description:
+        'Execute an automation workflow. Supply the input required by the workflow ' +
+        '(get from xdr_workflow_get). Use for PICERL containment actions like isolating ' +
+        'compromised assets, blocking C2 domains, or running custom response playbooks.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          workflow_id: { type: 'string' },
+          input: { type: 'object', description: 'Input parameters for the workflow. Schema varies by workflow.' },
+          comment: { type: 'string', description: 'Reason for execution — logged to worklog.' },
+        },
+        required: ['workflow_id'],
+      },
+    },
+
+    {
+      name: 'xdr_workflow_instance_list',
+      description:
+        'List past and currently running workflow executions with status (success/failed/running) ' +
+        'and output summary. Filter to a specific workflow or view all recent executions.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          workflow_id: { type: 'string', description: 'Filter to instances of a specific workflow. Omit for all.' },
+          limit: { type: 'number', default: 25 },
         },
       },
-      {
-        name: 'xdr_instance_cancel',
-        description: 'Cancel a running workflow instance.',
-        inputSchema: {
-          type: 'object',
-          properties: {
-            instance_id: { type: 'string' },
-          },
-          required: ['instance_id'],
-        },
-      },
+    },
 
-      // === Automation - Calendars, Schedules, Targets ===
-      {
-        name: 'xdr_calendars_list',
-        description: 'List all calendars.',
-        inputSchema: { type: 'object', properties: {} },
+    {
+      name: 'xdr_workflow_instance_get',
+      description: 'Get detailed output and execution trace of a specific workflow run.',
+      inputSchema: {
+        type: 'object',
+        properties: { instance_id: { type: 'string' } },
+        required: ['instance_id'],
       },
-      {
-        name: 'xdr_schedules_list',
-        description: 'List all schedules.',
-        inputSchema: { type: 'object', properties: {} },
-      },
-      {
-        name: 'xdr_targets_list',
-        description: 'List all targets (XDR targets for workflows).',
-        inputSchema: {
-          type: 'object',
-          properties: {
-            limit: { type: 'number' },
-            start: { type: 'number' },
-          },
-        },
-      },
+    },
 
-      // === Automation - Variables, Webhooks ===
-      {
-        name: 'xdr_variables_list',
-        description: 'List workflow variables.',
-        inputSchema: { type: 'object', properties: {} },
+    {
+      name: 'xdr_workflow_instance_cancel',
+      description: 'Cancel a currently running workflow instance.',
+      inputSchema: {
+        type: 'object',
+        properties: { instance_id: { type: 'string' } },
+        required: ['instance_id'],
       },
-      {
-        name: 'xdr_webhooks_list',
-        description: 'List webhooks.',
-        inputSchema: { type: 'object', properties: {} },
-      },
+    },
 
-      // === Profile & Users (Platform) ===
-      {
-        name: 'xdr_profile_get',
-        description: 'Get current user profile.',
-        inputSchema: { type: 'object', properties: {} },
-      },
-    ];
-  }
+    // ════════════════════════════════════════════════════════════════════════
+    //  SECTION 7 — ADMIN & PLATFORM
+    // ════════════════════════════════════════════════════════════════════════
+    {
+      name: 'xdr_integrations_list',
+      description:
+        'List all configured integration modules in your XDR org with health status. ' +
+        'Returns module_instance_id values needed for xdr_response_trigger. ' +
+        'Shows which of your integrations are healthy vs. erroring.',
+      inputSchema: { type: 'object', properties: {} },
+    },
 
-  private async handleToolCall(name: string, args: Record<string, unknown>): Promise<unknown> {
+    {
+      name: 'xdr_profile_get',
+      description: 'Get current XDR organization profile, API client scopes, and enabled features.',
+      inputSchema: { type: 'object', properties: {} },
+    },
+
+  ],
+}));
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  TOOL CALL HANDLER
+// ─────────────────────────────────────────────────────────────────────────────
+server.setRequestHandler(CallToolRequestSchema, async (request) => {
+  const { name, arguments: args } = request.params;
+
+  try {
     switch (name) {
+
+      // ──────────────────────────────────────────────────────────────────────
+      //  SECTION 1: INSPECT & INVESTIGATE
+      // ──────────────────────────────────────────────────────────────────────
+
       case 'xdr_inspect': {
-        const content = args.content as string;
-        if (!content) throw new Error('content is required');
-        return this.api.post('platform', '/iroh/iroh-inspect/inspect', { content });
+        const { content } = z.object({ content: z.string().max(2000) }).parse(args);
+        const result = await xdrApi.post(`${VIS}/iroh-inspect/inspect`, { content });
+        return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
       }
 
-      case 'xdr_enrich_observe': {
-        const obs1 = args.observables as Array<{ type: string; value: string }>;
-        if (!Array.isArray(obs1) || obs1.length === 0) throw new Error('observables array is required');
-        return this.api.post('platform', '/iroh/iroh-enrich/observe/observables', obs1);
+      case 'xdr_investigate': {
+        const { observables, include_verdicts, include_pivot_links } = z.object({
+          observables: z.array(ObservableInput).min(1),
+          include_verdicts: z.boolean().default(true),
+          include_pivot_links: z.boolean().default(true),
+        }).parse(args);
+
+        const calls: Promise<[string, unknown]>[] = [
+          xdrApi.post(`${VIS}/iroh-enrich/observe/observables`, observables).then((r) => ['sightings', r]),
+        ];
+        if (include_verdicts) {
+          calls.push(xdrApi.post(`${VIS}/iroh-enrich/deliberate/observables`, observables).then((r) => ['verdicts', r]));
+        }
+        if (include_pivot_links) {
+          calls.push(xdrApi.post(`${VIS}/iroh-enrich/refer/observables`, observables).then((r) => ['pivot_links', r]));
+        }
+        const results = await Promise.all(calls);
+        const combined = Object.fromEntries(results);
+        return { content: [{ type: 'text', text: JSON.stringify(combined, null, 2) }] };
       }
 
-      case 'xdr_enrich_deliberate': {
-        const obs2 = args.observables as Array<{ type: string; value: string }>;
-        if (!Array.isArray(obs2) || obs2.length === 0) throw new Error('observables array is required');
-        return this.api.post('platform', '/iroh/iroh-enrich/deliberate/observables', obs2);
+      case 'xdr_inspect_and_investigate': {
+        const { content } = z.object({ content: z.string().max(2000) }).parse(args);
+        const observables = (await xdrApi.post(`${VIS}/iroh-inspect/inspect`, { content })) as Array<{ type: string; value: string }>;
+        if (!observables || observables.length === 0) {
+          return {
+            content: [{ type: 'text', text: JSON.stringify({ observables_found: 0, message: 'No IOCs found in provided text.' }, null, 2) }],
+          };
+        }
+        const [sightings, verdicts, pivot_links] = await Promise.all([
+          xdrApi.post(`${VIS}/iroh-enrich/observe/observables`, observables),
+          xdrApi.post(`${VIS}/iroh-enrich/deliberate/observables`, observables),
+          xdrApi.post(`${VIS}/iroh-enrich/refer/observables`, observables),
+        ]);
+        return {
+          content: [{ type: 'text', text: JSON.stringify({ observables_found: observables, sightings, verdicts, pivot_links }, null, 2) }],
+        };
       }
 
-      case 'xdr_enrich_refer': {
-        const obs3 = args.observables as Array<{ type: string; value: string }>;
-        if (!Array.isArray(obs3) || obs3.length === 0) throw new Error('observables array is required');
-        return this.api.post('platform', '/iroh/iroh-enrich/refer/observables', obs3);
+      // ──────────────────────────────────────────────────────────────────────
+      //  SECTION 2: INCIDENTS
+      // ──────────────────────────────────────────────────────────────────────
+
+      case 'xdr_incidents_list': {
+        const { status, limit, offset, from, to } = z.object({
+          status: z.enum(['new','open','closed']).optional(),
+          limit: z.number().min(1).max(100).default(25),
+          offset: z.number().default(0),
+          from: z.string().optional(),
+          to: z.string().optional(),
+        }).parse(args ?? {});
+
+        const p = new URLSearchParams({ limit: String(limit), offset: String(offset) });
+        if (status) p.append('status', status === 'open' ? 'Open' : status === 'new' ? 'New' : 'Closed');
+        const now = new Date();
+        const fromDate = from ?? new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000).toISOString();
+        const toDate = to ?? now.toISOString();
+        p.append('from', fromDate);
+        p.append('to', toDate);
+        const result = await xdrApi.get(`${CONURE}/v2/incident/search?${p}`);
+        return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
       }
 
-      case 'xdr_incident_summary': {
-        const incId = args.incident_id as string;
-        if (!incId) throw new Error('incident_id is required');
-        return this.api.get('platform', `/iroh/private-intel/incident/${encodeURIComponent(incId)}/summary`);
+      case 'xdr_incident_get': {
+        const { incident_id } = z.object({ incident_id: z.string() }).parse(args);
+        const result = await xdrApi.get(`${VIS}/iroh-incident/incidents/${incident_id}`);
+        return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+      }
+
+      case 'xdr_incident_update': {
+        const { incident_id, status, assignee_id, resolution } = z.object({
+          incident_id: z.string(),
+          status: z.enum(['new','open','closed']).optional(),
+          assignee_id: z.string().optional(),
+          resolution: z.string().optional(),
+        }).parse(args);
+
+        const body: Record<string, unknown> = {};
+        if (status) body.status = status;
+        if (assignee_id) body.assignee_id = assignee_id;
+        if (resolution) body.resolution = resolution;
+
+        const result = await xdrApi.patch(`${VIS}/iroh-incident/incidents/${incident_id}`, body);
+        return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
       }
 
       case 'xdr_incident_worklog': {
-        const incId2 = args.incident_id as string;
-        if (!incId2) throw new Error('incident_id is required');
-        return this.api.get('platform', `/iroh/private-intel/incident/${encodeURIComponent(incId2)}/worklog`);
+        const { incident_id } = z.object({ incident_id: z.string() }).parse(args);
+        const result = await xdrApi.get(`${VIS}/iroh-incident/incidents/${incident_id}/worklog`);
+        return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
       }
 
-      case 'xdr_incident_create': {
-        const title = args.title as string;
-        if (!title) throw new Error('title is required');
-        const body = {
-          title,
-          description: (args.description as string) || '',
-          severity: (args.severity as number) ?? 50,
-          status: (args.status as string) || 'New',
-        };
-        return this.api.post('platform', '/iroh/private-intel/incident', body);
+      case 'xdr_incident_worklog_add': {
+        const { incident_id, note } = z.object({ incident_id: z.string(), note: z.string().min(1) }).parse(args);
+        const result = await xdrApi.post(`${VIS}/iroh-incident/incidents/${incident_id}/worklog`, { message: note });
+        return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
       }
 
-      case 'xdr_workflows_list': {
-        const limit = (args.limit as number) ?? 20;
-        const params: Record<string, string | number | boolean> = { limit };
-        if (args.start != null) params.start = args.start as number;
-        if (args.search) params.search = args.search as string;
-        if (args.state) params.state = args.state as string;
-        if (args.is_atomic != null) params.is_atomic = args.is_atomic as boolean;
-        return this.api.post('automate', '/v1.2/workflows', {}, params);
+      case 'xdr_incident_observables': {
+        const { incident_id } = z.object({ incident_id: z.string() }).parse(args);
+        const result = await xdrApi.get(`${VIS}/iroh-incident/incidents/${incident_id}/observables`);
+        return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+      }
+
+      // ──────────────────────────────────────────────────────────────────────
+      //  SECTION 3: RESPONSE ACTIONS
+      // ──────────────────────────────────────────────────────────────────────
+
+      case 'xdr_response_get_actions': {
+        const { observables } = z.object({ observables: z.array(ObservableInput).min(1) }).parse(args);
+        const result = await xdrApi.post(`${VIS}/iroh-response/respond/observables`, { observables });
+        return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+      }
+
+      case 'xdr_response_trigger': {
+        const { observable_type, observable_value, action_id, module_instance_id, module_type_id } = z.object({
+          observable_type: z.string(),
+          observable_value: z.string(),
+          action_id: z.string(),
+          module_instance_id: z.string(),
+          module_type_id: z.string(),
+        }).parse(args);
+
+        const result = await xdrApi.post(`${VIS}/iroh-response/respond/trigger`, {
+          observable: { type: observable_type, value: observable_value },
+          action_id,
+          module_instance_id,
+          module_type_id,
+        });
+        return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+      }
+
+      // ──────────────────────────────────────────────────────────────────────
+      //  SECTION 4: CASEBOOKS
+      // ──────────────────────────────────────────────────────────────────────
+
+      case 'xdr_casebook_list': {
+        const { limit, offset } = z.object({ limit: z.number().default(25), offset: z.number().default(0) }).parse(args ?? {});
+        const result = await xdrApi.get(`${VIS}/iroh-casebook/casebooks?limit=${limit}&offset=${offset}`);
+        return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+      }
+
+      case 'xdr_casebook_get': {
+        const { casebook_id } = z.object({ casebook_id: z.string() }).parse(args);
+        const result = await xdrApi.get(`${VIS}/iroh-casebook/casebooks/${casebook_id}`);
+        return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+      }
+
+      case 'xdr_casebook_create': {
+        const { title, description, observables, tlp } = z.object({
+          title: z.string(),
+          description: z.string().optional(),
+          observables: z.array(ObservableInput).default([]),
+          tlp: z.enum(['white','green','amber','red']).default('amber'),
+        }).parse(args);
+
+        const body: Record<string, unknown> = { title, tlp, type: 'casebook', schema_version: '1.0.17' };
+        if (description) body.description = description;
+        if (observables.length > 0) body.observables = observables;
+
+        const result = await xdrApi.post(`${VIS}/iroh-casebook/casebooks`, body);
+        return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+      }
+
+      case 'xdr_casebook_add_observables': {
+        const { casebook_id, observables } = z.object({
+          casebook_id: z.string(),
+          observables: z.array(ObservableInput).min(1),
+        }).parse(args);
+
+        const result = await xdrApi.post(`${VIS}/iroh-casebook/casebooks/${casebook_id}/observables`, { observables });
+        return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+      }
+
+      // ──────────────────────────────────────────────────────────────────────
+      //  SECTION 5: THREAT INTELLIGENCE
+      // ──────────────────────────────────────────────────────────────────────
+
+      case 'xdr_intel_indicators': {
+        const { query, limit, offset } = z.object({
+          query: z.string().optional(),
+          limit: z.number().default(25),
+          offset: z.number().default(0),
+        }).parse(args ?? {});
+
+        const p = new URLSearchParams({ limit: String(limit), offset: String(offset) });
+        if (query) p.append('query', query);
+        const result = await xdrApi.get(`${INTEL}/indicator/search?${p}`);
+        return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+      }
+
+      case 'xdr_intel_judgments': {
+        const { observable_type, observable_value, limit } = z.object({
+          observable_type: z.string(),
+          observable_value: z.string(),
+          limit: z.number().default(25),
+        }).parse(args);
+
+        const result = await xdrApi.get(
+          `${INTEL}/judgment/search?observable_type=${observable_type}&observable_value=${encodeURIComponent(observable_value)}&limit=${limit}`
+        );
+        return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+      }
+
+      case 'xdr_intel_feeds': {
+        const { limit } = z.object({ limit: z.number().default(25) }).parse(args ?? {});
+        const result = await xdrApi.get(`${INTEL}/feed/search?limit=${limit}`);
+        return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+      }
+
+      case 'xdr_intel_sightings': {
+        const { observable_type, observable_value, start_time, limit } = z.object({
+          observable_type: z.string(),
+          observable_value: z.string(),
+          start_time: z.string().optional(),
+          limit: z.number().default(50),
+        }).parse(args);
+
+        const p = new URLSearchParams({ observable_type, observable_value, limit: String(limit) });
+        if (start_time) p.append('observed_time.start_time', start_time);
+        const result = await xdrApi.get(`${INTEL}/sighting/search?${p}`);
+        return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+      }
+
+      // ──────────────────────────────────────────────────────────────────────
+      //  SECTION 6: WORKFLOWS & AUTOMATION
+      // ──────────────────────────────────────────────────────────────────────
+
+      case 'xdr_workflow_list': {
+        const { limit, offset, category } = z.object({
+          limit: z.number().default(50),
+          offset: z.number().default(0),
+          category: z.string().optional(),
+        }).parse(args ?? {});
+
+        const p = new URLSearchParams({ limit: String(limit), offset: String(offset) });
+        if (category) p.append('category', category);
+        const result = await xdrApi.get(`${AUTO}/v1/workflows?${p}`);
+        return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
       }
 
       case 'xdr_workflow_get': {
-        const wfId = args.workflow_id as string;
-        if (!wfId) throw new Error('workflow_id is required');
-        return this.api.get('automate', `/v1/workflows/${encodeURIComponent(wfId)}`);
+        const { workflow_id } = z.object({ workflow_id: z.string() }).parse(args);
+        const result = await xdrApi.get(`${AUTO}/v1/workflows/${workflow_id}`);
+        return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
       }
 
       case 'xdr_workflow_start': {
-        const wfId2 = args.workflow_id as string;
-        const uniqueName = args.unique_name as string;
-        if (!wfId2 && !uniqueName) throw new Error('workflow_id or unique_name is required');
-        const params: Record<string, string | boolean> = {};
-        if (wfId2) params.workflow_id = wfId2;
-        if (uniqueName) params.unique_name = uniqueName;
-        if (args.sync === true) params.sync = true;
-        if (args.async === true) params.async = true;
-        return this.api.post('automate', '/v1.1/workflows/start', undefined, params);
+        const { workflow_id, input, comment } = z.object({
+          workflow_id: z.string(),
+          input: z.record(z.unknown()).default({}),
+          comment: z.string().optional(),
+        }).parse(args);
+
+        const body: Record<string, unknown> = { input };
+        if (comment) body.comment = comment;
+        const result = await xdrApi.post(`${AUTO}/v1/workflows/${workflow_id}/start`, body);
+        return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
       }
 
-      case 'xdr_instances_list': {
-        const limit2 = args.limit as number;
-        const dateFrom = args.date_from as string;
-        if (limit2 == null || !dateFrom) throw new Error('limit and date_from are required');
-        const params2: Record<string, string | number> = { limit: limit2, date_from: dateFrom };
-        if (args.date_to) params2.date_to = args.date_to as string;
-        if (args.state) params2.state = args.state as string;
-        if (args.search) params2.search = args.search as string;
-        if (args.start != null) params2.start = args.start as number;
-        return this.api.post('automate', '/v1.1/instances', {}, params2);
+      case 'xdr_workflow_instance_list': {
+        const { workflow_id, limit } = z.object({
+          workflow_id: z.string().optional(),
+          limit: z.number().default(25),
+        }).parse(args ?? {});
+
+        const p = new URLSearchParams({ limit: String(limit) });
+        if (workflow_id) p.append('workflow_id', workflow_id);
+        const result = await xdrApi.get(`${AUTO}/v1/instances?${p}`);
+        return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
       }
 
-      case 'xdr_instance_get': {
-        const instId = args.instance_id as string;
-        if (!instId) throw new Error('instance_id is required');
-        return this.api.get('automate', `/v1/instances/${encodeURIComponent(instId)}`);
+      case 'xdr_workflow_instance_get': {
+        const { instance_id } = z.object({ instance_id: z.string() }).parse(args);
+        const result = await xdrApi.get(`${AUTO}/v1/instances/${instance_id}`);
+        return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
       }
 
-      case 'xdr_instance_cancel': {
-        const instId2 = args.instance_id as string;
-        if (!instId2) throw new Error('instance_id is required');
-        return this.api.post('automate', `/v1/instances/${encodeURIComponent(instId2)}/cancel`);
+      case 'xdr_workflow_instance_cancel': {
+        const { instance_id } = z.object({ instance_id: z.string() }).parse(args);
+        const result = await xdrApi.post(`${AUTO}/v1/instances/${instance_id}/cancel`, {});
+        return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
       }
 
-      case 'xdr_calendars_list':
-        return this.api.get('automate', '/v1/calendars');
+      // ──────────────────────────────────────────────────────────────────────
+      //  SECTION 7: ADMIN & PLATFORM
+      // ──────────────────────────────────────────────────────────────────────
 
-      case 'xdr_schedules_list':
-        return this.api.get('automate', '/v1/schedules');
-
-      case 'xdr_targets_list': {
-        const params3: Record<string, number> = {};
-        if (args.limit != null) params3.limit = args.limit as number;
-        if (args.start != null) params3.start = args.start as number;
-        return this.api.get('automate', '/v1/targets', params3);
+      case 'xdr_integrations_list': {
+        const result = await xdrApi.get(`${VIS}/iroh-int/integrations`);
+        return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
       }
 
-      case 'xdr_variables_list':
-        return this.api.get('automate', '/v1/variables');
-
-      case 'xdr_webhooks_list':
-        return this.api.get('automate', '/v1/webhooks');
-
-      case 'xdr_profile_get':
-        return this.api.get('platform', '/iroh/iroh-profile/profile');
+      case 'xdr_profile_get': {
+        const result = await xdrApi.get(`${VIS}/iroh-profile/profile`);
+        return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+      }
 
       default:
-        throw new Error(`Unknown tool: ${name}`);
+        return {
+          content: [{ type: 'text', text: JSON.stringify({ error: `Unknown tool: ${name}` }) }],
+          isError: true,
+        };
     }
+  } catch (error: unknown) {
+    const message = error instanceof Error ? error.message : String(error);
+    return {
+      content: [{ type: 'text', text: JSON.stringify({ error: message }, null, 2) }],
+      isError: true,
+    };
   }
+});
 
-  async run(): Promise<void> {
-    const transport = new StdioServerTransport();
-    await this.server.connect(transport);
-    console.error('Cisco XDR MCP Server running on stdio');
-  }
+// ─────────────────────────────────────────────────────────────────────────────
+//  START
+// ─────────────────────────────────────────────────────────────────────────────
+export async function run(): Promise<void> {
+  const transport = new StdioServerTransport();
+  await server.connect(transport);
+  console.error('Cisco XDR MCP Server v2.0.0 running — 27 tools registered');
 }

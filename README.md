@@ -1,14 +1,18 @@
 # Cisco XDR MCP Server
 
-MCP (Model Context Protocol) server that exposes Cisco XDR APIs as tools for AI assistants. Connects to the XDR portal (e.g. https://xdr.us.security.cisco.com/) and supports Automation, Enrich, Inspect, Incident Management, and more.
+MCP (Model Context Protocol) server that exposes Cisco XDR APIs as tools for AI assistants. Connects to the XDR portal (e.g. https://xdr.us.security.cisco.com/) with **27 tools** across Inspect, Investigate, Incidents, Response Actions, Casebooks, Threat Intel, Workflows, and Admin.
 
 ## Features
 
-- **Inspect**: Extract observables (IPs, domains, hashes, emails) from text
-- **Enrich**: Threat intelligence (observe, deliberate, refer) for observables
-- **Incidents**: Create, view summaries, worklogs
-- **Automation**: Workflows, instances, calendars, schedules, targets, variables, webhooks
-- **Profile**: Current user profile
+- **Inspect & Investigate**: Parse text for IOCs, full enrichment (sightings, verdicts, pivot links)
+- **Incidents**: List, get, update, worklog, extract observables
+- **Response Actions**: Discover and trigger (block, isolate, quarantine)
+- **Casebooks**: Create and manage investigation casebooks
+- **Threat Intel**: Indicators, judgments, feeds, sightings
+- **Workflows**: List, run, monitor automation workflows
+- **Admin**: Integrations list, profile
+
+> **See [INSTALL.md](INSTALL.md)** for detailed installation, API reference, change log, and troubleshooting.
 
 ## Credential Handling (Important)
 
@@ -125,12 +129,13 @@ Ensure `XDR_CLIENT_ID` and `XDR_CLIENT_PASSWORD` are sourced from your shell env
 
 ## Repository Structure
 
-This project follows the [CiscoDevNet devnet-template](https://github.com/CiscoDevNet/devnet-template):
-
+- **[INSTALL.md](INSTALL.md)** – Installation, API reference, change log, troubleshooting (go-to doc)
 - [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) – Standards for interaction
 - [CONTRIBUTING.md](CONTRIBUTING.md) – How to contribute
 - [SECURITY.md](SECURITY.md) – Security policies and reporting
 - [AGENTS.md](AGENTS.md) – Guidance for AI coding agents
+
+This project follows the [CiscoDevNet devnet-template](https://github.com/CiscoDevNet/devnet-template).
 
 ## License
 
