@@ -1,3 +1,8 @@
+/**
+ * Copyright 2026 Cisco Systems, Inc. and its affiliates
+ * * SPDX-License-Identifier: Apache-2.0
+ */
+
 /*
  * Cisco XDR MCP Server v2.0
  * 27 tools across Inspect, Investigate, Incidents, Response, Casebooks, Intel, Workflows, Admin
